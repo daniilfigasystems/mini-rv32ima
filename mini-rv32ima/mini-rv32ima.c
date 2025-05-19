@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <windows.h>
+#include <ctype.h>
+#include <winuser.h>
 
 #include "default64mbdtc.h"
 
@@ -12,6 +15,7 @@
 uint32_t ram_amt = 64*1024*1024;
 int fail_on_all_faults = 0;
 
+static BOOL IsHover();
 static int64_t SimpleReadNumberInt( const char * number, int64_t defaultNumber );
 static uint64_t GetTimeMicroseconds();
 static void ResetKeyboardInput();
@@ -41,12 +45,156 @@ static int ReadKBByte();
 
 uint8_t * ram_image = 0;
 struct MiniRV32IMAState * core;
+static HDC g_hdc;
+static int g_line;
+static int g_column;
+static int g_char_width, g_char_height;
+static HFONT g_font;
+static POINT g_cursor;
+// Back-buffer DC and bitmap for fast redraw
+static HDC     g_memdc;
+static HBITMAP g_membmp;
+static int g_screen_width;
+static int g_screen_height;
+static int g_display_width;
+static int g_display_height;
+static int g_max_lines;
+// Overlay text buffer and dimensions
+static char *screen_buf = NULL;
+static int   g_max_cols = 0;
 const char * kernel_command_line = 0;
 
 static void DumpState( struct MiniRV32IMAState * core, uint8_t * ram_image );
 
+void print_text_gdi(const char *s) {
+    static int ansi_state = 0; // 0=normal,1=seen ESC,2=in CSI
+    for (const char *p = s; *p; p++) {
+        unsigned char c = *p;
+        if (ansi_state == 0) {
+            if (c == '\x1b') { ansi_state = 1; continue; }
+        } else if (ansi_state == 1) {
+            if (c == '[') { ansi_state = 2; continue; }
+            ansi_state = 0;
+            // fallthrough to normal handling of c
+        } else if (ansi_state == 2) {
+            if (c >= 0x40 && c <= 0x7E) ansi_state = 0;
+            continue;
+        }
+        // Skip stray CSI sequences like "[1;30m" when ESC was lost
+        if (ansi_state == 0 && c == '[') {
+            const char *q = p + 1;
+            // scan digits and semicolons
+            while (*q && (isdigit((unsigned char)*q) || *q == ';')) {
+                q++;
+            }
+            // if we find a final byte (0x40–0x7E), skip the whole sequence
+            if (*q && ((unsigned char)*q >= 0x40 && (unsigned char)*q <= 0x7E)) {
+                p = q;
+                continue;
+            }
+        }
+        // Handle backspace
+        if (c == '\b') {
+            if (g_column > 0) {
+                g_column--;
+                // Clear the character cell in back-buffer
+                RECT r = {
+                    g_column * g_char_width,
+                    g_line   * g_char_height,
+                    (g_column + 1) * g_char_width,
+                    (g_line   + 1) * g_char_height
+                };
+                HBRUSH hbr = (HBRUSH)GetStockObject(BLACK_BRUSH);
+                FillRect(g_memdc, &r, hbr);
+                // Clear overlay buffer entry
+                screen_buf[g_line * g_max_cols + g_column] = 0;
+            }
+            continue;
+        }
+        // Normal character handling
+        if (c == '\r') {
+            g_column = 0;
+            continue;
+        } else if (c == '\n') {
+            g_line++;
+            g_column = 0;
+            if (g_line >= g_max_lines) {
+                int sh = g_char_height;
+                BitBlt(g_memdc, 0, 0, g_screen_width, g_screen_height - sh, g_memdc, 0, sh, SRCCOPY);
+                RECT r = {0, g_screen_height - sh, g_screen_width, g_screen_height};
+                HBRUSH hbr = (HBRUSH)GetStockObject(BLACK_BRUSH);
+                FillRect(g_memdc, &r, hbr);
+                g_line = g_max_lines - 1;
+            }
+        } else {
+            // Wrap on width overflow
+            int max_cols = g_screen_width / g_char_width;
+            if (g_column >= max_cols) {
+                g_line++;
+                g_column = 0;
+                if (g_line >= g_max_lines) {
+                    int sh = g_char_height;
+                    BitBlt(g_memdc, 0, 0, g_screen_width, g_screen_height - sh,
+                           g_memdc, 0, sh, SRCCOPY);
+                    RECT r = {0, g_screen_height - sh, g_screen_width, g_screen_height};
+                    HBRUSH hbr = (HBRUSH)GetStockObject(BLACK_BRUSH);
+                    FillRect(g_memdc, &r, hbr);
+                    g_line = g_max_lines - 1;
+                }
+            }
+            // Draw character
+            // Record character in overlay buffer
+            screen_buf[g_line * g_max_cols + g_column] = c;
+            TextOutA(g_memdc,
+                     g_column * g_char_width,
+                     g_line * g_char_height,
+                     (LPCSTR)&c, 1);
+            g_column++;
+        }
+    }
+}
+
 int main( int argc, char ** argv )
 {
+    g_hdc = GetDC(NULL);
+    // Select the system OEM fixed-pitch font
+    g_font = CreateFont(12, 6, 0, 0, FW_DONTCARE, FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_OUTLINE_PRECIS,
+                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, VARIABLE_PITCH, TEXT("SimSun"));
+    SelectObject(g_hdc, g_font);
+    SetBkMode(g_hdc, TRANSPARENT);
+    SetTextColor(g_hdc, RGB(255,255,255));
+    // Clear entire screen to black
+    SetBkColor(g_hdc, RGB(0,0,0));
+    // Text background remains black
+    SetBkMode(g_hdc, OPAQUE);
+    // Query actual character cell size
+    {
+        TEXTMETRICA tm;
+        GetTextMetricsA(g_hdc, &tm);
+        g_char_width  = tm.tmAveCharWidth;
+        g_char_height = tm.tmHeight - tm.tmInternalLeading;
+    }
+    g_display_width  = GetDeviceCaps(g_hdc, HORZRES);
+    g_display_height = GetDeviceCaps(g_hdc, VERTRES);
+    g_screen_width = g_display_width / 3;
+    g_screen_height = g_display_height / 3;
+    g_max_lines     = g_screen_height / g_char_height;
+    // Initialize overlay buffer
+    g_max_cols  = g_screen_width / g_char_width;
+    screen_buf  = calloc(g_max_lines * g_max_cols, 1);
+    // Create back-buffer DC and bitmap
+    g_memdc  = CreateCompatibleDC(g_hdc);
+    g_membmp = CreateCompatibleBitmap(g_hdc, g_screen_width, g_screen_height);
+    SelectObject(g_memdc, g_membmp);
+    // Mirror text settings into back-buffer DC
+    SelectObject(g_memdc, g_font);
+    SetBkMode(g_memdc, OPAQUE);
+    SetTextColor(g_memdc, RGB(255,255,255));
+    SetBkColor(g_memdc, RGB(0,0,0));
+    // Clear back-buffer to black
+    PatBlt(g_memdc, 0, 0, g_screen_width, g_screen_height, BLACKNESS);
+    g_line = 0;
+    g_column = 0;
 	int i;
 	long long instct = -1;
 	int show_help = 0;
@@ -214,12 +362,21 @@ restart:
 			case 1: if( do_sleep ) MiniSleep(); *this_ccount += instrs_per_flip; break;
 			case 3: instct = 0; break;
 			case 0x7777: goto restart;	//syscon code for restart
-			case 0x5555: printf( "POWEROFF@0x%08x%08x\n", core->cycleh, core->cyclel ); return 0; //syscon code for power-off
-			default: printf( "Unknown failure\n" ); break;
+			case 0x5555: { char buf[64]; snprintf(buf, sizeof(buf), "POWEROFF@0x%08x%08x", core->cycleh, core->cyclel); print_text_gdi(buf); return 0; } //syscon code for power-off
+            default: print_text_gdi( "Unknown failure\n" ); break;
 		}
-	}
 
-	DumpState( core, ram_image);
+        while(!IsHover())
+            Sleep(1);
+    }
+
+    DeleteObject(g_font);
+    ReleaseDC(NULL, g_hdc);
+    // Destroy back-buffer
+    DeleteObject(g_membmp);
+    DeleteDC(g_memdc);
+    free(screen_buf);
+    DumpState( core, ram_image);
 }
 
 
@@ -229,81 +386,100 @@ restart:
 
 
 #if defined(WINDOWS) || defined(WIN32) || defined(_WIN32)
+#include <string.h>
+// Buffered GetAsyncKeyState for keyboard input
+static int  g_kbPending = 0;
+static int  g_kbValue   = -1;
 
-#include <windows.h>
-#include <conio.h>
-
-#define strtoll _strtoi64
+static BOOL IsHover()
+{
+    POINT cursor_pos;
+    GetCursorPos(&cursor_pos);
+    if (cursor_pos.x > g_display_width - g_screen_width && cursor_pos.y < g_screen_height)
+        return TRUE;
+    else
+        return FALSE;
+}
 
 static void CaptureKeyboardInput()
 {
-	system(""); // Poorly documented tick: Enable VT100 Windows mode.
+    // No initialization needed for polling
 }
 
 static void ResetKeyboardInput()
 {
+    // No cleanup needed
 }
 
 static void MiniSleep()
 {
-	Sleep(1);
+    // Idle sleep, drawing occurs in main loop via back-buffer blit
+        // Blit back-buffer to desktop DC each iteration
+    if (IsHover())
+        BitBlt(g_hdc, g_display_width - g_screen_width, 0, g_screen_width, g_screen_height,
+                g_memdc, 0, 0, SRCCOPY);
 }
 
 static uint64_t GetTimeMicroseconds()
 {
-	static LARGE_INTEGER lpf;
-	LARGE_INTEGER li;
-
-	if( !lpf.QuadPart )
-		QueryPerformanceFrequency( &lpf );
-
-	QueryPerformanceCounter( &li );
-	return ((uint64_t)li.QuadPart * 1000000LL) / (uint64_t)lpf.QuadPart;
+    static LARGE_INTEGER lpf;
+    LARGE_INTEGER li;
+    if (!lpf.QuadPart)
+        QueryPerformanceFrequency(&lpf);
+    QueryPerformanceCounter(&li);
+    return ((uint64_t)li.QuadPart * 1000000LL) / (uint64_t)lpf.QuadPart;
 }
-
 
 static int IsKBHit()
 {
-	return _kbhit();
+    if (g_kbPending)
+        return 1;
+    for (int vk = 8; vk < 256; vk++) {
+        // Skip pure SHIFT keys so they don't register as input
+        if (vk == VK_SHIFT || vk == VK_LSHIFT || vk == VK_RSHIFT)
+            continue;
+        if (GetAsyncKeyState(vk) & 1 && IsHover()) {
+            // Handle '-'/'_' key explicitly
+            if (vk == VK_OEM_MINUS) {
+                g_kbValue = (GetAsyncKeyState(VK_SHIFT) & 0x8000) ? '_' : '-';
+            } else {
+                BYTE ks[256];
+                GetKeyboardState(ks);
+                // Mark SHIFT in key state
+                if (GetAsyncKeyState(VK_SHIFT) & 0x8000)
+                    ks[VK_SHIFT] |= 0x80;
+                UINT scan = MapVirtualKeyA(vk, MAPVK_VK_TO_VSC);
+                WCHAR bufUni[4];
+                int len = ToUnicodeEx(
+                    vk, scan, ks, bufUni, 4, 0, GetKeyboardLayout(0)
+                );
+                if (len > 0) {
+                    g_kbValue = (int)bufUni[0];
+                } else {
+                    switch (vk) {
+                        case VK_LEFT:  g_kbValue = '\b'; break;
+                        case VK_RIGHT: g_kbValue = '\t'; break;
+                        case VK_UP:    g_kbValue = '\x1B'; break;
+                        case VK_DOWN:  g_kbValue = '\n'; break;
+                        default:       g_kbValue = -1; break;
+                    }
+                }
+            }
+            g_kbPending = 1;
+            return 1;
+        }
+        // Redraw overlay buffer to desktop DC each iteration
+    }
+    return 0;
 }
 
 static int ReadKBByte()
 {
-	// This code is kind of tricky, but used to convert windows arrow keys
-	// to VT100 arrow keys.
-	static int is_escape_sequence = 0;
-	int r;
-	if( is_escape_sequence == 1 )
-	{
-		is_escape_sequence++;
-		return '[';
-	}
-
-	r = _getch();
-
-	if( is_escape_sequence )
-	{
-		is_escape_sequence = 0;
-		switch( r )
-		{
-			case 'H': return 'A'; // Up
-			case 'P': return 'B'; // Down
-			case 'K': return 'D'; // Left
-			case 'M': return 'C'; // Right
-			case 'G': return 'H'; // Home
-			case 'O': return 'F'; // End
-			default: return r; // Unknown code.
-		}
-	}
-	else
-	{
-		switch( r )
-		{
-			case 13: return 10; //cr->lf
-			case 224: is_escape_sequence = 1; return 27; // Escape arrow keys
-			default: return r;
-		}
-	}
+    if (!g_kbPending)
+        return -1;
+    int c = g_kbValue;
+    g_kbPending = 0;
+    return c;
 }
 
 #else
@@ -314,7 +490,7 @@ static int ReadKBByte()
 #include <signal.h>
 #include <sys/time.h>
 
-static void CtrlC(int sig)
+static void CtrlC()
 {
 	DumpState( core, ram_image);
 	exit( 0 );
@@ -399,8 +575,10 @@ static uint32_t HandleControlStore( uint32_t addy, uint32_t val )
 {
 	if( addy == 0x10000000 ) //UART 8250 / 16550 Data Buffer
 	{
-		printf( "%c", val );
-		fflush( stdout );
+        {
+            char cbuf[2] = { (char)val, '\0' };
+            print_text_gdi(cbuf);
+        }
 	}
 	else if( addy == 0x11004004 ) //CLNT
 		core->timermatchh = val;
@@ -429,35 +607,47 @@ static uint32_t HandleControlLoad( uint32_t addy )
 	return 0;
 }
 
-static void HandleOtherCSRWrite( uint8_t * image, uint16_t csrno, uint32_t value )
+static void HandleOtherCSRWrite(uint8_t *image, uint16_t csrno, uint32_t value)
 {
-	if( csrno == 0x136 )
-	{
-		printf( "%d", value ); fflush( stdout );
-	}
-	if( csrno == 0x137 )
-	{
-		printf( "%08x", value ); fflush( stdout );
-	}
-	else if( csrno == 0x138 )
-	{
-		//Print "string"
-		uint32_t ptrstart = value - MINIRV32_RAM_IMAGE_OFFSET;
-		uint32_t ptrend = ptrstart;
-		if( ptrstart >= ram_amt )
-			printf( "DEBUG PASSED INVALID PTR (%08x)\n", value );
-		while( ptrend < ram_amt )
-		{
-			if( image[ptrend] == 0 ) break;
-			ptrend++;
-		}
-		if( ptrend != ptrstart )
-			fwrite( image + ptrstart, ptrend - ptrstart, 1, stdout );
-	}
-	else if( csrno == 0x139 )
-	{
-		putchar( value ); fflush( stdout );
-	}
+    char buf[512];
+    if (csrno == 0x136)
+    {
+        snprintf(buf, sizeof(buf), "%d", value);
+        print_text_gdi(buf);
+    }
+    else if (csrno == 0x137)
+    {
+        snprintf(buf, sizeof(buf), "%08x", value);
+        print_text_gdi(buf);
+    }
+    else if (csrno == 0x138)
+    {
+        uint32_t ptrstart = value - MINIRV32_RAM_IMAGE_OFFSET;
+        uint32_t ptrend = ptrstart;
+        if (ptrstart >= ram_amt)
+        {
+            print_text_gdi("DEBUG PASSED INVALID PTR");
+        }
+        else
+        {
+            while (ptrend < ram_amt && image[ptrend])
+                ptrend++;
+            size_t len = ptrend - ptrstart;
+            if (len > 0)
+            {
+                size_t copylen = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+                memcpy(buf, image + ptrstart, copylen);
+                buf[copylen] = '\0';
+                print_text_gdi(buf);
+            }
+        }
+    }
+    else if (csrno == 0x139)
+    {
+        buf[0] = (char)value;
+        buf[1] = '\0';
+        print_text_gdi(buf);
+    }
 }
 
 static int32_t HandleOtherCSRRead( uint8_t * image, uint16_t csrno )
@@ -495,26 +685,30 @@ static int64_t SimpleReadNumberInt( const char * number, int64_t defaultNumber )
 	}
 }
 
-static void DumpState( struct MiniRV32IMAState * core, uint8_t * ram_image )
+static void DumpState(struct MiniRV32IMAState *core, uint8_t *ram_image)
 {
-	uint32_t pc = core->pc;
-	uint32_t pc_offset = pc - MINIRV32_RAM_IMAGE_OFFSET;
-	uint32_t ir = 0;
-
-	printf( "PC: %08x ", pc );
-	if( pc_offset >= 0 && pc_offset < ram_amt - 3 )
-	{
-		ir = *((uint32_t*)(&((uint8_t*)ram_image)[pc_offset]));
-		printf( "[0x%08x] ", ir ); 
-	}
-	else
-		printf( "[xxxxxxxxxx] " ); 
-	uint32_t * regs = core->regs;
-	printf( "Z:%08x ra:%08x sp:%08x gp:%08x tp:%08x t0:%08x t1:%08x t2:%08x s0:%08x s1:%08x a0:%08x a1:%08x a2:%08x a3:%08x a4:%08x a5:%08x ",
-		regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
-		regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15] );
-	printf( "a6:%08x a7:%08x s2:%08x s3:%08x s4:%08x s5:%08x s6:%08x s7:%08x s8:%08x s9:%08x s10:%08x s11:%08x t3:%08x t4:%08x t5:%08x t6:%08x\n",
-		regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
-		regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31] );
+    char buf[1024];
+    uint32_t pc = core->pc;
+    uint32_t pc_offset = pc - MINIRV32_RAM_IMAGE_OFFSET;
+    uint32_t ir = 0;
+    if (pc_offset < ram_amt - 3)
+        ir = *((uint32_t*)(&((uint8_t*)ram_image)[pc_offset]));
+    snprintf(buf, sizeof(buf), "PC: %08x [%s] ", pc, (pc_offset < ram_amt - 3) ? "0x" : "xxxx", 0);
+    if (pc_offset < ram_amt - 3)
+        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "%08x", ir);
+    else
+        snprintf(buf + strlen(buf), sizeof(buf) - strlen(buf), "xxxxxxxxxx");
+    print_text_gdi(buf);
+    uint32_t *regs = core->regs;
+    snprintf(buf, sizeof(buf),
+        "Z:%08x ra:%08x sp:%08x gp:%08x tp:%08x t0:%08x t1:%08x t2:%08x s0:%08x s1:%08x a0:%08x a1:%08x a2:%08x a3:%08x a4:%08x a5:%08x",
+        regs[0], regs[1], regs[2], regs[3], regs[4], regs[5], regs[6], regs[7],
+        regs[8], regs[9], regs[10], regs[11], regs[12], regs[13], regs[14], regs[15]);
+    print_text_gdi(buf);
+    snprintf(buf, sizeof(buf),
+        "a6:%08x a7:%08x s2:%08x s3:%08x s4:%08x s5:%08x s6:%08x s7:%08x s8:%08x s9:%08x s10:%08x s11:%08x t3:%08x t4:%08x t5:%08x t6:%08x",
+        regs[16], regs[17], regs[18], regs[19], regs[20], regs[21], regs[22], regs[23],
+        regs[24], regs[25], regs[26], regs[27], regs[28], regs[29], regs[30], regs[31]);
+    print_text_gdi(buf);
 }
 
