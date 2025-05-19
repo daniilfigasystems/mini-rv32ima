@@ -1,4 +1,7 @@
-# riscv_emufun (mini-rv32ima)
+# riscv_emufun (mini-rv32ima-gdi)
+
+## About fork
+This fork contain emulator ported to windows gdi api so it can run directly on the screen.
 
 Click below for the YouTube video introducing this project:
 
